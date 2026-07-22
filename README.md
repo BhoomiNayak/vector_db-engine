@@ -1,4 +1,4 @@
-# VectorDB Engine — Built from Scratch in C++
+# VectorDB Engine 
 
 A high-performance vector database and RAG (Retrieval-Augmented Generation) system implemented entirely in C++ with a real-time web interface. Implements production-grade search algorithms (HNSW, KD-Tree, multi-threaded Brute Force) with binary persistence, API authentication, and a full document embedding pipeline powered by local LLMs.
 
