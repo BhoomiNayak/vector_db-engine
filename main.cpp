@@ -15,6 +15,7 @@
 #include <functional>
 #include <fstream>
 #include <climits>
+#include <thread>
 
 static const int DIMS = 16;   // demo vectors
 // Doc embeddings dimension is determined at runtime from Ollama's model output
@@ -74,11 +75,15 @@ public:
     void insert(const VectorItem& v) { items.push_back(v); }
 
     std::vector<std::pair<float,int>> knn(
-        const std::vector<float>& q, int k, DistFn dist)
+        const std::vector<float>& q, int k, DistFn dist,
+        const std::string& filterCat = "")
     {
         std::vector<std::pair<float,int>> r;
         r.reserve(items.size());
-        for (auto& v : items) r.push_back({dist(q, v.emb), v.id});
+        for (auto& v : items) {
+            if (!filterCat.empty() && v.category != filterCat) continue;
+            r.push_back({dist(q, v.emb), v.id});
+        }
         std::sort(r.begin(), r.end());
         if ((int)r.size() > k) r.resize(k);
         return r;
@@ -87,6 +92,51 @@ public:
     void remove(int id) {
         items.erase(std::remove_if(items.begin(), items.end(),
             [id](const VectorItem& v){ return v.id == id; }), items.end());
+    }
+
+    std::vector<std::pair<float,int>> knn_parallel(
+        const std::vector<float>& q, int k, DistFn dist,
+        const std::string& filterCat = "", int num_threads = 0)
+    {
+        if (num_threads <= 0) {
+            num_threads = (int)std::thread::hardware_concurrency();
+            if (num_threads <= 0) num_threads = 4;
+        }
+        if ((int)items.size() < num_threads * 2) return knn(q, k, dist, filterCat);
+
+        std::vector<std::vector<std::pair<float,int>>> partials(num_threads);
+        std::vector<std::thread> threads;
+        threads.reserve(num_threads);
+
+        int chunk = (int)items.size() / num_threads;
+        for (int t = 0; t < num_threads; t++) {
+            int start = t * chunk;
+            int end = (t == num_threads - 1) ? (int)items.size() : start + chunk;
+            threads.emplace_back([&, t, start, end]() {
+                auto& local = partials[t];
+                local.reserve(end - start);
+                for (int i = start; i < end; i++) {
+                    if (!filterCat.empty() && items[i].category != filterCat) continue;
+                    local.push_back({dist(q, items[i].emb), items[i].id});
+                }
+            });
+        }
+        for (auto& th : threads) th.join();
+
+        // Merge all partial results
+        std::vector<std::pair<float,int>> merged;
+        size_t total = 0;
+        for (auto& p : partials) total += p.size();
+        merged.reserve(total);
+        for (auto& p : partials) merged.insert(merged.end(), p.begin(), p.end());
+        std::sort(merged.begin(), merged.end());
+        if ((int)merged.size() > k) merged.resize(k);
+        return merged;
+    }
+
+    int getThreadCount() {
+        int n = (int)std::thread::hardware_concurrency();
+        return n > 0 ? n : 4;
     }
 };
 
@@ -370,16 +420,43 @@ public:
     struct SearchOut { std::vector<Hit> hits; long long us; std::string algo, metric; };
 
     SearchOut search(const std::vector<float>& q, int k,
-                     const std::string& metric, const std::string& algo)
+                     const std::string& metric, const std::string& algo,
+                     const std::string& category = "")
     {
         std::lock_guard<std::mutex> lk(mu);
         auto dfn = getDistFn(metric);
         auto t0  = std::chrono::high_resolution_clock::now();
 
         std::vector<std::pair<float,int>> raw;
-        if      (algo == "bruteforce") raw = bf.knn(q, k, dfn);
-        else if (algo == "kdtree")     raw = kdt.knn(q, k, dfn);
-        else                           raw = hnsw.knn(q, k, 50, dfn);
+        if (algo == "bruteforce") {
+            raw = bf.knn(q, k, dfn, category);
+        } else if (algo == "bruteforce_parallel") {
+            raw = bf.knn_parallel(q, k, dfn, category);
+        } else if (algo == "kdtree") {
+            // Over-fetch and post-filter for tree-based indexes
+            int fetch = category.empty() ? k : k * 4;
+            raw = kdt.knn(q, fetch, dfn);
+            if (!category.empty()) {
+                std::vector<std::pair<float,int>> filtered;
+                for (auto& [d, id] : raw)
+                    if (store.count(id) && store[id].category == category)
+                        filtered.push_back({d, id});
+                raw = filtered;
+                if ((int)raw.size() > k) raw.resize(k);
+            }
+        } else {
+            // HNSW: over-fetch and post-filter
+            int fetch = category.empty() ? k : k * 4;
+            raw = hnsw.knn(q, fetch, 50, dfn);
+            if (!category.empty()) {
+                std::vector<std::pair<float,int>> filtered;
+                for (auto& [d, id] : raw)
+                    if (store.count(id) && store[id].category == category)
+                        filtered.push_back({d, id});
+                raw = filtered;
+                if ((int)raw.size() > k) raw.resize(k);
+            }
+        }
 
         long long us = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::high_resolution_clock::now() - t0).count();
@@ -391,7 +468,7 @@ public:
         return out;
     }
 
-    struct BenchOut { long long bfUs, kdUs, hnswUs; int n; };
+    struct BenchOut { long long bfUs, kdUs, hnswUs, bfParUs; int n, threads; };
 
     BenchOut benchmark(const std::vector<float>& q, int k, const std::string& metric) {
         std::lock_guard<std::mutex> lk(mu);
@@ -406,7 +483,9 @@ public:
             time([&]{ bf.knn(q, k, dfn); }),
             time([&]{ kdt.knn(q, k, dfn); }),
             time([&]{ hnsw.knn(q, k, 50, dfn); }),
-            (int)store.size()
+            time([&]{ bf.knn_parallel(q, k, dfn); }),
+            (int)store.size(),
+            bf.getThreadCount()
         };
     }
 
@@ -425,6 +504,51 @@ public:
     size_t size() {
         std::lock_guard<std::mutex> lk(mu);
         return store.size();
+    }
+
+    // ── Binary Persistence ──────────────────────────────────────────
+    void save(const std::string& path) {
+        std::lock_guard<std::mutex> lk(mu);
+        std::ofstream f(path, std::ios::binary);
+        if (!f.is_open()) return;
+        // Header: magic "VDBX", version 1, count
+        f.write("VDBX", 4);
+        int ver = 1; f.write(reinterpret_cast<char*>(&ver), 4);
+        int cnt = (int)store.size(); f.write(reinterpret_cast<char*>(&cnt), 4);
+        for (auto& [id, v] : store) {
+            int vid = v.id; f.write(reinterpret_cast<char*>(&vid), 4);
+            int mlen = (int)v.metadata.size(); f.write(reinterpret_cast<char*>(&mlen), 4);
+            f.write(v.metadata.data(), mlen);
+            int clen = (int)v.category.size(); f.write(reinterpret_cast<char*>(&clen), 4);
+            f.write(v.category.data(), clen);
+            f.write(reinterpret_cast<const char*>(v.emb.data()), dims * sizeof(float));
+        }
+    }
+
+    bool load(const std::string& path) {
+        std::lock_guard<std::mutex> lk(mu);
+        std::ifstream f(path, std::ios::binary);
+        if (!f.is_open()) return false;
+        char magic[4]; f.read(magic, 4);
+        if (std::string(magic, 4) != "VDBX") return false;
+        int ver; f.read(reinterpret_cast<char*>(&ver), 4);
+        int cnt; f.read(reinterpret_cast<char*>(&cnt), 4);
+        int maxId = 0;
+        auto dist = getDistFn("cosine");
+        for (int i = 0; i < cnt; i++) {
+            VectorItem v;
+            f.read(reinterpret_cast<char*>(&v.id), 4);
+            int mlen; f.read(reinterpret_cast<char*>(&mlen), 4);
+            v.metadata.resize(mlen); f.read(&v.metadata[0], mlen);
+            int clen; f.read(reinterpret_cast<char*>(&clen), 4);
+            v.category.resize(clen); f.read(&v.category[0], clen);
+            v.emb.resize(dims); f.read(reinterpret_cast<char*>(v.emb.data()), dims * sizeof(float));
+            store[v.id] = v;
+            bf.insert(v); kdt.insert(v); hnsw.insert(v, dist);
+            if (v.id > maxId) maxId = v.id;
+        }
+        nextId = maxId + 1;
+        return true;
     }
 };
 
@@ -708,6 +832,55 @@ public:
     }
 
     int getDims() { return dims; }
+
+    // ── Binary Persistence ──────────────────────────────────────────
+    void save(const std::string& path) {
+        std::lock_guard<std::mutex> lk(mu);
+        std::ofstream f(path, std::ios::binary);
+        if (!f.is_open()) return;
+        // Header: magic "DDBX", version 1, dims, count
+        f.write("DDBX", 4);
+        int ver = 1; f.write(reinterpret_cast<char*>(&ver), 4);
+        int d = dims; f.write(reinterpret_cast<char*>(&d), 4);
+        int cnt = (int)store.size(); f.write(reinterpret_cast<char*>(&cnt), 4);
+        for (auto& [id, doc] : store) {
+            int did = doc.id; f.write(reinterpret_cast<char*>(&did), 4);
+            int tlen = (int)doc.title.size(); f.write(reinterpret_cast<char*>(&tlen), 4);
+            f.write(doc.title.data(), tlen);
+            int xlen = (int)doc.text.size(); f.write(reinterpret_cast<char*>(&xlen), 4);
+            f.write(doc.text.data(), xlen);
+            f.write(reinterpret_cast<const char*>(doc.emb.data()), dims * sizeof(float));
+        }
+    }
+
+    bool load(const std::string& path) {
+        std::lock_guard<std::mutex> lk(mu);
+        std::ifstream f(path, std::ios::binary);
+        if (!f.is_open()) return false;
+        char magic[4]; f.read(magic, 4);
+        if (std::string(magic, 4) != "DDBX") return false;
+        int ver; f.read(reinterpret_cast<char*>(&ver), 4);
+        int d; f.read(reinterpret_cast<char*>(&d), 4);
+        dims = d;
+        int cnt; f.read(reinterpret_cast<char*>(&cnt), 4);
+        int maxId = 0;
+        for (int i = 0; i < cnt; i++) {
+            DocItem doc;
+            f.read(reinterpret_cast<char*>(&doc.id), 4);
+            int tlen; f.read(reinterpret_cast<char*>(&tlen), 4);
+            doc.title.resize(tlen); f.read(&doc.title[0], tlen);
+            int xlen; f.read(reinterpret_cast<char*>(&xlen), 4);
+            doc.text.resize(xlen); f.read(&doc.text[0], xlen);
+            doc.emb.resize(dims); f.read(reinterpret_cast<char*>(doc.emb.data()), dims * sizeof(float));
+            store[doc.id] = doc;
+            VectorItem vi{doc.id, doc.title, "doc", doc.emb};
+            hnsw.insert(vi, cosine);
+            bf.insert(vi);
+            if (doc.id > maxId) maxId = doc.id;
+        }
+        nextId = maxId + 1;
+        return true;
+    }
 };
 
 // =====================================================================
@@ -760,6 +933,137 @@ void loadDemo(VectorDB& db) {
 }
 
 // =====================================================================
+//  API KEY AUTHENTICATION
+// =====================================================================
+
+std::string generateApiKey() {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<int> dis(0, 15);
+    const char hex[] = "0123456789abcdef";
+    std::string key;
+    key.reserve(32);
+    for (int i = 0; i < 32; i++) key += hex[dis(gen)];
+    return key;
+}
+
+std::string loadOrCreateApiKey(const std::string& path) {
+    std::ifstream in(path);
+    if (in.is_open()) {
+        std::string key;
+        std::getline(in, key);
+        if (!key.empty()) return key;
+    }
+    std::string key = generateApiKey();
+    std::ofstream out(path);
+    out << key;
+    return key;
+}
+
+// =====================================================================
+//  USAGE TRACKER
+// =====================================================================
+
+class UsageTracker {
+    struct EndpointStats {
+        int totalCalls = 0;
+        long long totalLatencyUs = 0;
+        std::vector<long long> recentTimestamps;
+    };
+    std::unordered_map<std::string, EndpointStats> stats;
+    std::mutex mu;
+    std::chrono::steady_clock::time_point startTime;
+    int callsSinceSave = 0;
+
+    void pruneOldTimestamps(EndpointStats& es) {
+        auto now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        // Keep only last 60 seconds
+        es.recentTimestamps.erase(
+            std::remove_if(es.recentTimestamps.begin(), es.recentTimestamps.end(),
+                [now](long long ts) { return now - ts > 60; }),
+            es.recentTimestamps.end());
+    }
+
+public:
+    UsageTracker() : startTime(std::chrono::steady_clock::now()) {}
+
+    void record(const std::string& endpoint, long long latencyUs) {
+        std::lock_guard<std::mutex> lk(mu);
+        auto& es = stats[endpoint];
+        es.totalCalls++;
+        es.totalLatencyUs += latencyUs;
+        auto now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        es.recentTimestamps.push_back(now);
+        callsSinceSave++;
+        if (callsSinceSave >= 10) {
+            callsSinceSave = 0;
+            saveLocked("usage.dat");
+        }
+    }
+
+    std::string toJson() {
+        std::lock_guard<std::mutex> lk(mu);
+        auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - startTime).count();
+        int totalQueries = 0;
+        std::ostringstream ss;
+        ss << "{\"endpoints\":{";
+        bool first = true;
+        for (auto& [name, es] : stats) {
+            pruneOldTimestamps(es);
+            if (!first) ss << ','; first = false;
+            long long avg = es.totalCalls > 0 ? es.totalLatencyUs / es.totalCalls : 0;
+            double qpm = es.recentTimestamps.size();  // calls in the last 60s = QPM
+            ss << jS(name) << ":{\"totalCalls\":" << es.totalCalls
+               << ",\"avgLatencyUs\":" << avg
+               << ",\"qpm\":" << std::fixed << std::setprecision(1) << qpm << '}';
+            totalQueries += es.totalCalls;
+        }
+        ss << "},\"totalQueries\":" << totalQueries
+           << ",\"uptimeSeconds\":" << uptime << '}';
+        return ss.str();
+    }
+
+    void save(const std::string& path) {
+        std::lock_guard<std::mutex> lk(mu);
+        saveLocked(path);
+    }
+
+private:
+    void saveLocked(const std::string& path) {
+        std::ofstream f(path, std::ios::binary);
+        if (!f.is_open()) return;
+        f.write("USGE", 4);
+        int cnt = (int)stats.size(); f.write(reinterpret_cast<char*>(&cnt), 4);
+        for (auto& [name, es] : stats) {
+            int nlen = (int)name.size(); f.write(reinterpret_cast<char*>(&nlen), 4);
+            f.write(name.data(), nlen);
+            f.write(reinterpret_cast<char*>(&es.totalCalls), 4);
+            f.write(reinterpret_cast<char*>(&es.totalLatencyUs), 8);
+        }
+    }
+
+public:
+    void load(const std::string& path) {
+        std::lock_guard<std::mutex> lk(mu);
+        std::ifstream f(path, std::ios::binary);
+        if (!f.is_open()) return;
+        char magic[4]; f.read(magic, 4);
+        if (std::string(magic, 4) != "USGE") return;
+        int cnt; f.read(reinterpret_cast<char*>(&cnt), 4);
+        for (int i = 0; i < cnt; i++) {
+            int nlen; f.read(reinterpret_cast<char*>(&nlen), 4);
+            std::string name(nlen, ' '); f.read(&name[0], nlen);
+            auto& es = stats[name];
+            f.read(reinterpret_cast<char*>(&es.totalCalls), 4);
+            f.read(reinterpret_cast<char*>(&es.totalLatencyUs), 8);
+        }
+    }
+};
+
+// =====================================================================
 //  HTTP SERVER
 // =====================================================================
 
@@ -768,13 +1072,38 @@ int main() {
     DocumentDB docDB;
     OllamaClient ollama;
 
-    loadDemo(db);
+    // Load persisted data or fall back to demo
+    bool vdbLoaded = db.load("vectordb.dat");
+    if (!vdbLoaded) loadDemo(db);
+    docDB.load("docdb.dat");
+
+    // API Key
+    std::string apiKey = loadOrCreateApiKey("api_key.txt");
+
+    // Usage tracker
+    UsageTracker tracker;
+    tracker.load("usage.dat");
+
+    // Auth check helper
+    auto checkAuth = [&](const httplib::Request& req, httplib::Response& res) -> bool {
+        auto key = req.get_header_value("X-API-Key");
+        if (key != apiKey) {
+            cors(res);
+            res.status = 401;
+            res.set_content("{\"error\":\"Invalid or missing API key\"}", "application/json");
+            return false;
+        }
+        return true;
+    };
 
     // Check Ollama at startup (non-fatal)
     bool ollamaUp = ollama.isAvailable();
     std::cout << "=== VectorDB Engine ===" << std::endl;
     std::cout << "http://localhost:8080" << std::endl;
-    std::cout << db.size() << " demo vectors | " << DIMS << " dims | HNSW+KD-Tree+BruteForce" << std::endl;
+    std::cout << db.size() << " vectors | " << DIMS << " dims | HNSW+KD-Tree+BruteForce" << std::endl;
+    if (vdbLoaded) std::cout << "Loaded vectordb.dat" << std::endl;
+    else           std::cout << "No vectordb.dat found — loaded demo data" << std::endl;
+    std::cout << "API Key: " << apiKey << std::endl;
     std::cout << "Ollama: " << (ollamaUp ? "ONLINE" : "OFFLINE (install from ollama.com)") << std::endl;
     if (ollamaUp) std::cout << "  embed model: " << ollama.embedModel
                             << "  gen model: "   << ollama.genModel << std::endl;
@@ -799,8 +1128,10 @@ int main() {
         try { k = std::stoi(req.get_param_value("k")); } catch (...) {}
         auto metric = req.get_param_value("metric"); if (metric.empty()) metric = "cosine";
         auto algo   = req.get_param_value("algo");   if (algo.empty())   algo   = "hnsw";
+        auto cat    = req.get_param_value("category");
+        if (cat == "all") cat = "";
 
-        auto out = db.search(q, k, metric, algo);
+        auto out = db.search(q, k, metric, algo, cat);
         std::ostringstream ss;
         ss << "{\"results\":[";
         for (size_t i = 0; i < out.hits.size(); i++) {
@@ -815,23 +1146,29 @@ int main() {
         ss << "],\"latencyUs\":" << out.us
            << ",\"algo\":"       << jS(out.algo)
            << ",\"metric\":"     << jS(out.metric) << '}';
+        tracker.record("search", out.us);
         res.set_content(ss.str(), "application/json");
     });
 
     svr.Post("/insert", [&](const httplib::Request& req, httplib::Response& res) {
         cors(res);
+        if (!checkAuth(req, res)) return;
         std::string meta, cat; std::vector<float> emb;
         if (!parseBody(req.body, meta, cat, emb) || (int)emb.size() != DIMS) {
             res.set_content("{\"error\":\"invalid body\"}", "application/json"); return;
         }
         int id = db.insert(meta, cat, emb, getDistFn("cosine"));
+        db.save("vectordb.dat");
+        tracker.record("insert", 0);
         res.set_content("{\"id\":" + std::to_string(id) + "}", "application/json");
     });
 
     svr.Delete(R"(/delete/(\d+))", [&](const httplib::Request& req, httplib::Response& res) {
         cors(res);
+        if (!checkAuth(req, res)) return;
         int id  = std::stoi(req.matches[1]);
         bool ok = db.remove(id);
+        if (ok) db.save("vectordb.dat");
         res.set_content("{\"ok\":" + std::string(ok ? "true" : "false") + "}",
                         "application/json");
     });
@@ -864,7 +1201,11 @@ int main() {
         auto b = db.benchmark(q, k, metric);
         std::ostringstream ss;
         ss << "{\"bruteforceUs\":" << b.bfUs << ",\"kdtreeUs\":" << b.kdUs
-           << ",\"hnswUs\":"       << b.hnswUs << ",\"itemCount\":" << b.n << '}';
+           << ",\"hnswUs\":"       << b.hnswUs
+           << ",\"bruteforceParallelUs\":" << b.bfParUs
+           << ",\"threads\":"      << b.threads
+           << ",\"itemCount\":"    << b.n << '}';
+        tracker.record("benchmark", b.bfUs + b.kdUs + b.hnswUs + b.bfParUs);
         res.set_content(ss.str(), "application/json");
     });
 
@@ -904,6 +1245,7 @@ int main() {
     // Chunks the text, embeds each chunk via Ollama, stores in DocumentDB
     svr.Post("/doc/insert", [&](const httplib::Request& req, httplib::Response& res) {
         cors(res);
+        if (!checkAuth(req, res)) return;
         auto title = extractStr(req.body, "title");
         auto text  = extractStr(req.body, "text");
         if (title.empty() || text.empty()) {
@@ -934,14 +1276,18 @@ int main() {
         for (size_t i = 0; i < ids.size(); i++) { if (i) ss << ','; ss << ids[i]; }
         ss << "],\"chunks\":" << chunks.size()
            << ",\"dims\":"    << docDB.getDims() << '}';
+        docDB.save("docdb.dat");
+        tracker.record("doc/insert", 0);
         res.set_content(ss.str(), "application/json");
     });
 
     // DELETE /doc/delete/123
     svr.Delete(R"(/doc/delete/(\d+))", [&](const httplib::Request& req, httplib::Response& res) {
         cors(res);
+        if (!checkAuth(req, res)) return;
         int id  = std::stoi(req.matches[1]);
         bool ok = docDB.remove(id);
+        if (ok) docDB.save("docdb.dat");
         res.set_content("{\"ok\":" + std::string(ok ? "true" : "false") + "}",
                         "application/json");
     });
@@ -1023,9 +1369,11 @@ int main() {
         std::string prompt =
             "You are a helpful assistant. Answer the user's question directly. "
             "Use the provided context if it contains relevant information. "
-            "If it doesn't, just use your own general knowledge. "
+            "When referencing information from the context, cite it using [1], [2], or [3] "
+            "corresponding to the context numbers provided. "
+            "If the context doesn't contain relevant information, just use your own general knowledge. "
             "IMPORTANT: Do NOT mention the 'context', 'provided text', or say things like 'the context doesn't mention'. "
-            "Just answer the question naturally.\n\n"
+            "Just answer the question naturally with inline citations.\n\n"
             "Context:\n" + ctx.str() +
             "Question: " + question + "\n\n"
             "Answer:";
@@ -1046,6 +1394,7 @@ int main() {
                << ",\"distance\":" << std::fixed << std::setprecision(4) << hits[i].first << '}';
         }
         ss << "],\"docCount\":" << docDB.size() << '}';
+        tracker.record("doc/ask", 0);
         res.set_content(ss.str(), "application/json");
     });
 
@@ -1069,7 +1418,7 @@ int main() {
         std::ostringstream ss;
         ss << "{\"count\":"      << db.size()
            << ",\"dims\":"       << DIMS
-           << ",\"algorithms\":[\"bruteforce\",\"kdtree\",\"hnsw\"]"
+           << ",\"algorithms\":[\"bruteforce\",\"bruteforce_parallel\",\"kdtree\",\"hnsw\"]"
            << ",\"metrics\":[\"euclidean\",\"cosine\",\"manhattan\"]}";
         res.set_content(ss.str(), "application/json");
     });
@@ -1084,6 +1433,22 @@ int main() {
             "text/html");
     });
 
+    // GET /auth/validate
+    svr.Get("/auth/validate", [&](const httplib::Request& req, httplib::Response& res) {
+        cors(res);
+        auto key = req.get_header_value("X-API-Key");
+        bool valid = (key == apiKey);
+        res.set_content("{\"valid\":" + std::string(valid ? "true" : "false") + "}",
+                        "application/json");
+    });
+
+    // GET /stats/usage
+    svr.Get("/stats/usage", [&](const httplib::Request&, httplib::Response& res) {
+        cors(res);
+        res.set_content(tracker.toJson(), "application/json");
+    });
+
     svr.listen("0.0.0.0", 8080);
+    tracker.save("usage.dat");
     return 0;
 }
